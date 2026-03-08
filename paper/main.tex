@@ -1,30 +1,513 @@
-\\documentclass[11pt]{article}
+\documentclass[11pt]{article}
 
-\\usepackage[utf8]{inputenc}
-\\usepackage[T1]{fontenc}
-\\usepackage{lmodern}
-\\usepackage{amsmath,amssymb}
-\\usepackage{graphicx}
-\\usepackage{booktabs}
-\\usepackage{hyperref}
-\\usepackage[numbers]{natbib}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage[margin=1.25in]{geometry}
+\usepackage{hyperref}
+\usepackage[numbers]{natbib}
 
-\\title{Verified Orchestration}
-\\author{Cynthia Huang}
-\\date{\\today}
+\newtheorem{definition}{Definition}[section]
+\newtheorem{assumption}[definition]{Assumption}
+\newtheorem{proposition}[definition]{Proposition}
+\newtheorem{theorem}[definition]{Theorem}
+\newtheorem{corollary}[definition]{Corollary}
+\newcommand{\sem}[1]{[\![#1]\!]}
 
-\\begin{document}
+\title{COMPOSER: Repair-Aware Verified Planning for Contract-Grounded Multi-Agent Workflows}
+\author{Cynthia Huang}
+\date{\today}
 
-\\maketitle
+\begin{document}
 
-\\begin{abstract}
-TODO: Add abstract.
-\\end{abstract}
+\maketitle
 
-\\section{Introduction}
-TODO: Add introduction.
+\begin{abstract}
+Large language model multi-agent systems are increasingly used for long-horizon workflows involving delegation, tool use, approvals, and external side effects. In these settings, correctness depends not only on task completion but also on procedural compliance with capability, provenance, approval, and temporal policies. Existing work largely separates search-oriented orchestration from runtime policy enforcement: one line of work optimizes task utility without formal governance guarantees, while another blocks unsafe actions after a workflow has already been proposed \citep{AFlow,ADAS,PCAS,Maris,Agent-C}. We present COMPOSER, a repair-aware orchestration algorithm that plans over partial-order workflow graphs whose nodes are typed by skill contracts. COMPOSER interleaves LLM proposal with symbolic verification and, when a candidate workflow is unsafe or infeasible, computes a minimum-cost compliant repair over a bounded grammar of reassignment, substitution, approval insertion, reordering, sanitization, and contract-defined decomposition edits. Under contract refinement and complete mediation, verified workflows execute without violating the supported DSL fragment. We evaluate COMPOSER on workforce scheduling and customer support tasks against free-form planning, runtime-only guardrails, verified planning without repair, and natural-language retry baselines. [Results sentence to fill after experiments.]
+\end{abstract}
 
-\\bibliographystyle{plainnat}
-\\bibliography{bib/references}
+\section{Introduction}
+LLM agents are moving from isolated tool calls to multi-agent systems that decompose tasks, delegate subtasks, exchange artifacts, and trigger external side effects. This shift makes procedural correctness a first-class concern. In enterprise settings, success is not just ``did the system produce a useful output?'' It is also ``did the right agent act, with the right capability, on the right artifact, in the right order, with the right approvals?'' A workflow can appear successful while still violating governance policy, leaking sensitive data, or bypassing required review.
 
-\\end{document}
+This gap matters because standard task-level evaluation can hide procedural failure. Recent procedure-aware evaluation work reports that a substantial fraction of benchmark-reported agent ``successes'' are in fact procedurally corrupt: the end goal is achieved, but the system reaches it through invalid intermediate behavior \citep{PAE}. That observation motivates an orchestration problem that current agent frameworks do not fully address.
+
+Existing work largely falls into two camps. Search-oriented orchestration methods such as ADAS and AFlow treat agent or workflow design as a search problem and optimize task utility, cost, or latency \citep{ADAS,AFlow}. Enforcement-oriented systems such as PCAS, Maris, Agent-C, and ShieldAgent focus on preventing unsafe behavior during execution through policy mediation, constrained generation, or temporal monitoring \citep{PCAS,Maris,Agent-C,ShieldAgent}. These are important advances, but they still leave a missing layer between ``search for a useful workflow'' and ``block unsafe actions at runtime.'' In particular, most systems either let the model recover from denials in free form or repair only the next action locally. They do not treat workflow repair itself as a first-class planning problem.
+
+We address this gap with COMPOSER, a repair-aware orchestration algorithm for contract-grounded multi-agent workflows. COMPOSER represents each callable skill by a typed contract that summarizes functional behavior and governance semantics: input and output types, preconditions, postconditions, side effects, capability requirements, provenance restrictions, temporal constraints, approvals, and allowed decomposition templates. Planning proceeds over a partial-order workflow graph. At each step, the LLM proposes a small batch of local graph extensions for one unresolved requirement. A symbolic verifier checks each extension for type, policy, temporal, and footprint consistency. If an extension is invalid, COMPOSER does not simply reject it or re-prompt the model in free form. Instead, it computes a bounded minimum-cost compliant repair over a finite edit grammar.
+
+The resulting contribution is not ``another guardrail.'' It is a planning algorithm in which verification actively shapes the search space and repairs unsafe candidate workflows before execution. This design lets us target two modest but meaningful guarantees: execution soundness for a tractable DSL fragment, and exact minimum-cost repair within a bounded witness-guided repair neighborhood.
+
+This paper makes three contributions. First, it formulates policy-heavy multi-agent orchestration as best-first partial-order planning over contract-typed workflow graphs. Second, it introduces a counterexample-guided planning algorithm that combines LLM proposal, symbolic verification, and bounded exact repair. Third, it provides formal soundness and exact K-repair claims for the supported DSL fragment and evaluates the method on two realistic domains: workforce scheduling and customer support.
+
+\section{Method}
+COMPOSER plans over partially specified workflow graphs under typed contracts. Given a task instance $x$, agents $A$, skills $S$, contracts $C$, and policies $P$, it returns either a verified workflow graph $W^*$ or a safe failure or escalation outcome. The central design choice is that the LLM does not generate an entire workflow in one shot. Instead, it proposes a small batch of local graph extensions for one open requirement at a time, and a symbolic verifier accepts, rejects, or repairs those extensions before any external effect is executed.
+
+\subsection{Skill contracts and DSL}
+Each skill $s \in S$ is associated with a contract
+\[
+c_s=(\tau_{in},\tau_{out},pre,post,rw,cap,prov,temp,esc,\mathcal{D}_s),
+\]
+where $\tau_{in}$ and $\tau_{out}$ are input and output types; $pre$ and $post$ are preconditions and postconditions; $rw$ is the declared read/write footprint; $cap$ specifies required roles or capabilities; $prov$ specifies provenance and data-flow restrictions; $temp$ specifies temporal constraints; $esc$ specifies approval or escalation requirements; and $\mathcal{D}_s$ is a finite set of contract-defined decomposition templates.
+
+The DSL is intentionally narrow. It does not attempt to model arbitrary enterprise policy. Instead, it is designed to cover the subset needed for capability checks, information-flow control, approvals, and temporal ordering while remaining decidable and operationally useful. The formal assumption that the policy sublanguage is stratifiable is stated in Section~3.
+
+A workflow graph is
+\[
+W=(V,E_{\prec},E_{flow},\lambda),
+\]
+where $V$ is a set of abstract action nodes, $E_{\prec}$ is a precedence relation, $E_{flow}$ is an artifact-flow relation, and
+\[
+\lambda(v)=(task_v,skill_v,agent_v,in_v,out_v)
+\]
+stores the local action specification.
+
+Core workflow facts include
+\[
+\texttt{skill(v,s)},\; \texttt{agent(v,a)},\; \texttt{before(u,v)},\; \texttt{flow(o,u,v)},\; \texttt{input(v,o)},\; \texttt{output(v,o)},\; \texttt{type(o,t)},\; \texttt{label(o,l)},\; \texttt{source(o,p)}.
+\]
+
+Core policy facts include
+\[
+\texttt{has\_cap(a,c)},\; \texttt{requires\_cap(s,c)},\; \texttt{needs\_approval(v,r)},\; \texttt{approved(v,r)},\; \texttt{reads(s,o)},\; \texttt{writes(s,o)}.
+\]
+
+The same DSL is extended slightly by domain.
+
+For workforce scheduling, examples include
+\[
+\texttt{has\_credential(a,k)},\; \texttt{assigned\_shift(a,h)},\; \texttt{rest\_gap(a,h\_i,h\_j)},\; \texttt{cross\_unit(v)},\; \texttt{overtime(v)}.
+\]
+
+For customer support, examples include
+\[
+\texttt{authenticated(ticket)},\; \texttt{refund\_amount(ticket,m)},\; \texttt{payment\_method(ticket,p)},\; \texttt{contains\_pii(o)},\; \texttt{redacted(o)}.
+\]
+
+Representative policy rules are:
+\[
+\texttt{viol\_cap(V)} \leftarrow \texttt{agent(V,A)},\; \texttt{skill(V,S)},\; \texttt{requires\_cap(S,C)},\; \neg \texttt{has\_cap(A,C)}
+\]
+and
+\[
+\texttt{viol\_prov(V,O)} \leftarrow \texttt{input(V,O)},\; \texttt{label(O,L)},\; \texttt{forbidden\_label(skill(V),L)},\; \neg \texttt{sanitized(O)}.
+\]
+
+\subsection{Planning state and score}
+A planning state is
+\[
+z=\langle W,U,M,g \rangle,
+\]
+where $W$ is the current workflow graph, $U$ is the set of open requirements, $M$ is witness memory, and $g$ is accumulated cost.
+
+Open requirements include unresolved top-level goals, unsatisfied skill preconditions, missing approvals, and unbound input artifacts. The planner uses a fail-first heuristic and selects the most constrained open requirement first, i.e., the one with the fewest statically compatible skills after type and capability filtering.
+
+We rank frontier states with
+\[
+\text{Score}(z)=\alpha \hat U(W)-\beta \text{ExecCost}(W)-\gamma \text{RepairCostAcc}(W)-\delta |U|,
+\]
+where
+\[
+\hat U(W)=\frac{\sum_{g_i \in G_x} w_i \mathbf{1}[W \vdash g_i]}{\sum_{g_i \in G_x} w_i}
+\]
+is the weighted fraction of task goals already discharged by the current workflow, $G_x$ is the goal set for task $x$, and $W \vdash g_i$ means that some verified path in $W$ entails goal $g_i$. At episode end, we report the same quantity as $\text{UtilityRet}(W)$, so the planning objective and evaluation metric are aligned.
+
+\subsection{Main planning loop}
+For a selected open requirement $q$, the planner builds a compact prompt containing the current workflow summary, the target requirement, the statically admissible skills and agents, and up to five deduplicated one-line prohibitions derived from recent witnesses in $M[q]$. A witness such as ``refund approval assigned to a tier-1 agent lacking manager privilege'' is rendered as: ``Do not assign refund approval to a tier-1 agent; manager privilege is required.''
+
+The LLM returns a batch of structured micro-plans. Each micro-plan is a local graph patch consisting of node additions, artifact bindings, agent assignments, and ordering edges.
+
+\paragraph{Algorithm 1: COMPOSER-PLAN}
+\begin{verbatim}
+Input:
+  x      : task instance
+  A,S,C,P: agents, skills, contracts, policies
+  B      : LLM batch size
+  K      : repair depth bound
+  T      : max planner iterations
+
+Output:
+  Verified workflow W* or FAIL/ESCALATE
+
+1:  W0 <- INIT-WORKFLOW(x)
+2:  U0 <- OPEN-REQUIREMENTS(W0)
+3:  M0 <- empty
+4:  F  <- priority queue ordered by Score
+5:  PUSH(F, <W0,U0,M0,0>)
+
+6:  for t = 1..T do
+7:      if F = empty then return FAIL
+8:      <W,U,M,g> <- POP-BEST(F)
+
+9:      if U = empty and VERIFY-INCREMENTAL(W,C,P) = SAT then
+10:         return W
+
+11:     q   <- SELECT-OPEN-REQUIREMENT(U)
+12:     Sq  <- TYPE-FILTER(q,S,C)
+13:     Aq  <- CAPABILITY-FILTER(q,Sq,A,C)
+14:     Pi  <- BUILD-PROMPT(x,W,q,Sq,Aq,TRUNC5(M[q]))
+15:     Delta <- LLM-PROPOSE-BATCH(Pi,B)
+
+16:     for each delta in Delta do
+17:         W' <- APPLY-EXTENSION(W,delta)
+18:         (verdict, xi) <- VERIFY-INCREMENTAL(W',C,P)
+
+19:         if verdict = SAT then
+20:             U' <- OPEN-REQUIREMENTS(W')
+21:             g' <- g + EXEC-DELTA(W,W')
+22:             PUSH(F, <W',U',M,g'>)
+
+23:         else
+24:             M[q] <- DEDUP(TRUNC5(M[q] union {NL-WITNESS(xi)}))
+25:             W_r <- EXACT-K-REPAIR(W',xi,C,P,K)
+
+26:             if W_r != FAIL then
+27:                 U_r <- OPEN-REQUIREMENTS(W_r)
+28:                 g_r <- g + EXEC-DELTA(W,W_r) + EDIT-COST(W',W_r)
+29:                 PUSH(F, <W_r,U_r,M,g_r>)
+
+30:  return FAIL
+\end{verbatim}
+
+\subsection{Incremental verification}
+\texttt{VERIFY-INCREMENTAL} composes four decidable checkers over the modified workflow.
+
+First, a type unifier checks that every consumed artifact is produced by a compatible skill and that all required inputs are bound.
+
+Second, a stratified Datalog engine reasons over capability, provenance, approval, and derived policy predicates.
+
+Third, an STN-style temporal checker tests consistency of precedence edges and difference constraints such as authentication-before-access or minimum rest windows.
+
+Fourth, a footprint checker ensures that the workflow's implied read/write behavior is contained within the declared footprint of each skill contract.
+
+If all checks pass, the extension is admitted. Otherwise, the verifier returns a structured witness
+\[
+\xi=(class,locus,predicate,evidence,ops),
+\]
+where $class$ is the violation type, $locus$ is the offending node or edge, $predicate$ is the violated rule, $evidence$ is the supporting fact set, and $ops$ is the set of admissible repair families.
+
+\paragraph{Algorithm 2: VERIFY-INCREMENTAL}
+\begin{verbatim}
+Input:
+  W      : candidate workflow
+  C,P    : contracts and policies
+
+Output:
+  (SAT, empty) or (UNSAT, witness xi)
+
+1:  tau <- TYPE-CHECK(W,C)
+2:  if tau = FAIL then return (UNSAT, TYPE-WITNESS(tau))
+
+3:  F <- MATERIALIZE-FACTS(W,C,P)
+4:  d <- DATALOG-CHECK(F)
+5:  if d = FAIL then return (UNSAT, DATALOG-WITNESS(d))
+
+6:  S <- BUILD-STN(W,C,P)
+7:  if STN-CONSISTENT(S) = false then
+8:      return (UNSAT, TEMPORAL-WITNESS(S))
+
+9:  rho <- FOOTPRINT-CHECK(W,C)
+10: if rho = FAIL then return (UNSAT, FOOTPRINT-WITNESS(rho))
+
+11: return (SAT, empty)
+\end{verbatim}
+
+If multiple violations are present, the verifier returns one prioritized witness, preferring local, high-confidence violations first. This is a pragmatic design choice. It also means that the repair depth $K$ bounds the total number of repair edits, not the number of logically distinct violations. In principle, a workflow with many independent trivial violations could exceed the repair budget even if each violation were individually fixable. In practice, the planner verifies incrementally, so violations are typically caught before many of them accumulate in the same candidate graph.
+
+\subsection{Witness-guided exact repair}
+When verification fails, COMPOSER repairs the post-extension graph $W'$, not the pre-extension graph $W$. Repair operates over a bounded witness-guided neighborhood
+\[
+\mathcal{R}_K(W';\xi_0)
+\]
+generated by six operators:
+\[
+\{\texttt{REASSIGN},\texttt{SUBSTITUTE},\texttt{INSERT\_APPROVAL},\texttt{REORDER},\texttt{SANITIZE},\texttt{DECOMPOSE}\}.
+\]
+
+\texttt{DECOMPOSE} is restricted to finite contract-defined templates so that repair remains symbolic and searchable.
+
+A concrete template for customer support is:
+\[
+\texttt{HANDLE\_LARGE\_REFUND(ticket)}
+\Rightarrow
+[\texttt{AUTHENTICATE},\texttt{CHECK\_ELIGIBILITY},\texttt{REQUEST\_MANAGER\_APPROVAL},\texttt{EXECUTE\_REFUND},\texttt{REDACT\_TRANSCRIPT},\texttt{LOG\_CASE}]
+\]
+with required precedence constraints
+\[
+\texttt{AUTHENTICATE} \prec \texttt{CHECK\_ELIGIBILITY} \prec \texttt{REQUEST\_MANAGER\_APPROVAL} \prec \texttt{EXECUTE\_REFUND}
+\]
+and
+\[
+\texttt{REDACT\_TRANSCRIPT} \prec \texttt{LOG\_CASE}.
+\]
+
+Repair uses uniform-cost search with nonnegative additive operator costs.
+
+\paragraph{Algorithm 3: EXACT-K-REPAIR}
+\begin{verbatim}
+Input:
+  W'     : invalid post-extension workflow
+  xi0    : initial violation witness
+  C,P    : contracts and policies
+  K      : depth bound
+  b      : max concrete edits per operator family
+
+Output:
+  Minimum-cost compliant repair in R_K(W';xi0), or FAIL
+
+1:  O <- priority queue ordered by cumulative edit cost
+2:  PUSH(O, (W', xi0, depth=0, cost=0))
+3:  best[CANONICALIZE(W')] <- 0
+
+4:  while O != empty do
+5:      (W_cur, xi_cur, d, c) <- POP-MIN(O)
+6:      (verdict, xi_now) <- VERIFY-INCREMENTAL(W_cur,C,P)
+
+7:      if verdict = SAT then return W_cur
+8:      if d = K then continue
+
+9:      Ops <- INSTANTIATE-OPS(W_cur, xi_now, C, b)
+
+10:     for each op in Ops do
+11:         W_next <- APPLY-REPAIR(W_cur, op)
+12:         key    <- CANONICALIZE(W_next)
+13:         c_next <- c + OP-COST(op)
+
+14:         if c_next < best.get(key, infinity) then
+15:             best[key] <- c_next
+16:             PUSH(O, (W_next, xi_now, d+1, c_next))
+
+17: return FAIL
+\end{verbatim}
+
+The branching factor is bounded after static filtering. If each witness activates at most $r$ repair families and each family generates at most $b$ concrete edits, then the repair neighborhood size is at most
+\[
+\sum_{i=0}^{K}(rb)^i.
+\]
+With $K=2$, $r \leq 4$, and $b=3$, the bound is $1+12+144=157$ states per repair call.
+
+\subsection{Canonicalization and complexity}
+Repair search avoids revisiting semantically equivalent workflows via \texttt{CANONICALIZE}. Two workflows are treated as duplicates if they are isomorphic under node renamings that preserve skill identity, agent role class, artifact types and labels, approval status, and labeled edge structure. We compute a canonical label on the transitive-reduced workflow graph and hash its sorted node-edge representation. Because workflows in our setting are small, exact canonical labeling is practical.
+
+The formal machinery is designed so that the main symbolic components are tractable: type unification is standard, stratified Datalog query answering is polynomial in data complexity, STN consistency is polynomial, and repair search is bounded by $K$, $r$, and $b$. The outer loop remains heuristic because it depends on LLM proposal quality. In experiments we plan to use $B=4$, $T=50$, and $K=2$ as default budgets and to report planner expansions, repair calls, token cost, and wall-clock time explicitly.
+
+\subsection{Why graph-level repair is not just local correction}
+The difference from local next-action correction matters. Consider a customer-support plan:
+\begin{enumerate}
+\item \texttt{ISSUE\_REFUND(\$900)} by a tier-1 agent
+\item \texttt{LOG\_CASE(raw\_transcript)}
+\item \texttt{CLOSE\_TICKET}
+\end{enumerate}
+
+A local correction mechanism can replace step 1 with \texttt{ESCALATE\_FOR\_APPROVAL}, but the workflow remains invalid because authentication is still missing and raw PII still flows into logging. COMPOSER can instead repair the graph by inserting \texttt{AUTHENTICATE}, decomposing refund handling into \texttt{CHECK\_ELIGIBILITY} $\rightarrow$ \texttt{REQUEST\_MANAGER\_APPROVAL} $\rightarrow$ \texttt{EXECUTE\_REFUND}, reassigning approval to a manager, and inserting \texttt{REDACT\_TRANSCRIPT} before \texttt{LOG\_CASE}. This is a joint repair over multiple nodes and edges, not a one-step patch.
+
+\subsection{Contract refinement in practice and runtime limitations}
+The theory below treats contract refinement as a formal assumption. In the simulator, we establish it by construction: each skill is implemented either as a simulator transition or as an audited wrapper whose schema, label emission, and read/write footprint are defined to match the contract. For wrapped skills, we additionally run unit tests over typed I/O and declared effect summaries. Outside the simulator, contract refinement remains an audited assumption rather than an automatically proved property.
+
+Our guarantees also assume complete mediation. Hidden side effects such as implicit provider-side caching, out-of-band logging, or partially committed external API writes are out of scope unless surfaced through wrappers as declared effects. In the prototype, such operations are either modeled conservatively as non-rollbackable writes or excluded from the guarantee.
+
+\section{Theory}
+We model each mediated skill $s$ by a concrete transition relation
+\[
+\sem{s} \subseteq \Sigma \times I \times A \times O \times \Sigma',
+\]
+where $\Sigma$ is the concrete system state, $I$ is the input space, $A$ is the acting agent, and $O$ is the output space. A contract $c_s$ induces an abstract transition relation $\sem{c_s}$ over typed inputs and outputs, declared footprints, provenance summaries, approvals, and temporal predicates.
+
+\begin{definition}[Contract refinement]
+A skill $s$ refines its contract $c_s$, written
+\[
+s \sqsubseteq c_s,
+\]
+if for every mediated invocation
+\[
+(\sigma,i,a,o,\sigma') \in \sem{s}
+\]
+such that the contract preconditions and input typing hold, the following conditions are satisfied:
+\begin{enumerate}
+\item $o$ has output type $\tau_{out}$;
+\item the contract postconditions hold;
+\item the concrete read/write footprint is contained in the declared footprint;
+\item the emitted labels and provenance facts agree with the contract summary.
+\end{enumerate}
+\end{definition}
+
+\begin{definition}[Workflow satisfaction]
+A workflow graph $W$ satisfies the supported DSL fragment, written
+\[
+W \models C \land P,
+\]
+if all three conditions hold:
+\begin{enumerate}
+\item no capability, provenance, or approval violation predicate is derivable under the policy program;
+\item all type and footprint checks succeed;
+\item the induced temporal network is consistent.
+\end{enumerate}
+\end{definition}
+
+\begin{assumption}[Stratified policy program]
+The Datalog policy program is stratified: negative literals range only over extensional predicates such as \texttt{has\_cap}, \texttt{approved}, \texttt{authenticated}, and \texttt{sanitized}, and no derived predicate participates in a negation cycle. Therefore the program has a unique minimal model.
+\end{assumption}
+
+\begin{proposition}[Verifier soundness]
+Assume the type checker is sound for artifact typing, the Datalog checker is sound for the policy sublanguage, the temporal checker is sound for the supported temporal fragment, and the footprint checker is sound for declared effect inclusion. Then \texttt{VERIFY-INCREMENTAL} is sound for the conjunction of these fragments.
+\end{proposition}
+
+\paragraph{Proof sketch.}
+\texttt{VERIFY-INCREMENTAL} accepts only if all four component checkers accept. By assumption, each checker is sound on its own fragment. Type checking and STN consistency are standard; soundness of query answering for stratified Datalog is classical; footprint inclusion is a direct set-containment check over declared effects. Since the supported DSL fragment is defined as the conjunction of these checked conditions, acceptance implies $W \models C \land P$.
+
+\begin{theorem}[Execution soundness]
+Assume:
+\begin{enumerate}
+\item every executed skill $s$ refines its contract $c_s$;
+\item \texttt{VERIFY-INCREMENTAL} is sound for the supported DSL fragment;
+\item all messages, reads, writes, approvals, and tool invocations are completely mediated;
+\item runtime execution instantiates only nodes and edges of a verified workflow $W$.
+\end{enumerate}
+Then every concrete execution trace produced by COMPOSER satisfies all capability, provenance, approval, and temporal constraints expressible in the supported DSL fragment.
+\end{theorem}
+
+\paragraph{Proof sketch.}
+Since $W$ is verified, its abstract trace contains no derivable violation predicate and its temporal network is consistent. Complete mediation ensures that each concrete step corresponds to an abstract workflow step. Contract refinement lifts each concrete step to a contract-consistent abstract transition. An induction over execution order shows that type, provenance, approval, and temporal invariants are preserved throughout the trace.
+
+\begin{proposition}[Bounded repair neighborhood]\label{prop:bounded-space}
+If each witness activates at most $r$ repair families and each family generates at most $b$ concrete edits after static filtering, then the witness-guided repair neighborhood at depth $K$ has size at most
+\[
+\sum_{i=0}^{K}(rb)^i.
+\]
+\end{proposition}
+
+\paragraph{Proof sketch.}
+The repair search tree has branching factor at most $rb$. Summing the nodes up to depth $K$ yields the bound.
+
+\begin{proposition}[Repair termination]
+For fixed $K$, finite operator instantiation bound $b$, and exact duplicate pruning via \texttt{CANONICALIZE}, \texttt{EXACT-K-REPAIR} terminates.
+\end{proposition}
+
+\paragraph{Proof sketch.}
+By Proposition~\ref{prop:bounded-space} the search space is finite. Duplicate states are pruned at non-increasing cost, so no infinite revisit sequence is possible.
+
+\begin{theorem}[Exact minimal K-repair]
+Let $\mathcal{R}_K(W';\xi_0)$ denote the witness-guided repair neighborhood of the invalid post-extension graph $W'$ at depth at most $K$. Assume repair costs are additive and nonnegative. If there exists a compliant repair within $\mathcal{R}_K(W';\xi_0)$, then \texttt{EXACT-K-REPAIR} returns
+\[
+W^*=\arg\min_{W_r \in \mathcal{R}_K(W';\xi_0),\, W_r \models C \land P} \text{Cost}(W',W_r).
+\]
+Otherwise it returns \texttt{FAIL}.
+\end{theorem}
+
+\paragraph{Proof sketch.}
+\texttt{EXACT-K-REPAIR} performs uniform-cost search over a finite neighborhood. Uniform-cost search returns the first goal state at minimum cumulative cost when edge costs are nonnegative. Duplicate pruning preserves the cheapest path to each canonicalized state. Therefore the returned compliant workflow is the minimum-cost repair inside $\mathcal{R}_K(W';\xi_0)$.
+
+\begin{corollary}[Safe failure]
+If no compliant workflow is reachable within the planner and repair budget, COMPOSER returns failure or escalation without executing a violating action.
+\end{corollary}
+
+\paragraph{Justification.}
+COMPOSER defers execution until a workflow passes \texttt{VERIFY-INCREMENTAL}, and runtime mediation blocks any action not justified by a verified workflow node. Therefore no violating action is executed regardless of whether planning succeeds or fails.
+
+\section{Experimental Plan}
+We evaluate three hypotheses. First, planning-time verification should reduce denial burden relative to runtime-only enforcement because structurally bad workflows are corrected earlier. Second, witness-guided symbolic repair should preserve more compliant utility than natural-language retry alone because many failures require coordinated graph edits rather than local self-correction. Third, COMPOSER should fail safely on infeasible tasks rather than forcing non-compliant completion.
+
+\subsection{Domains}
+We use two policy-heavy domains.
+
+In workforce scheduling and dispatch, tasks include filling an urgent shift gap, reassigning a worker across units, handling overtime coverage, and routing exception escalations. Policies include credential requirements, minimum rest windows, overtime limits, supervisor approval for cross-unit reassignment or overtime, and restricted sharing of worker or customer notes.
+
+In customer support, tasks include authenticating a user, checking refund eligibility, escalating high-value refunds, processing a refund, and logging the interaction. Policies include authentication-before-access, refund thresholds requiring manager approval, payment-method constraints, and PII redaction before storage or transfer.
+
+These two domains are deliberately complementary: workforce scheduling stresses temporal and capability structure, while customer support stresses approvals and information-flow governance.
+
+\subsection{Instance generation and reference workflows}
+Task instances are produced by a hidden generator rather than authored directly from prompts.
+
+For each domain, we sample a schema instance consisting of available agents, roles, capabilities, active skills, artifact types, and policy configuration. We then sample a task template and a constraint-density level: low, medium, or high.
+
+For feasible instances, we generate a compliant reference workflow using an offline exact reference planner over a finite library of domain templates. The reference planner enumerates template skeletons up to a bounded horizon, instantiates compatible skills and agents, verifies each candidate under the same formal DSL constraints, and retains the minimum-cost compliant workflow. Because the template library is finite and generated workflows are short, this planner is exact for the generated instances within the template space.
+
+For infeasible instances, we inject irreconcilable constraints, for example no worker satisfying both credential and rest-window requirements, or a refund request that requires mutually incompatible approvals. These instances test safe-failure behavior rather than recovery to a feasible plan.
+
+Each generated instance is rendered into natural language through multiple paraphrase templates with randomized slot realization. To avoid overly formulaic task descriptions, we additionally construct a small human-authored stress-test set for each domain. Results are reported separately on generated and authored slices.
+
+A practical evaluation configuration is 50 development and 150 test generated instances per domain, with 10--15\% of the test set explicitly infeasible, plus 15 human-authored stress tests per domain.
+
+\subsection{Baselines}
+All methods use the same backbone model, simulator, skill inventory, and contracts. The comparison is between orchestration regimes, not between unrelated agent stacks.
+
+The free-form planner plans and executes without formal verification.
+
+The Verifier + NL retry baseline uses planning-time verification, but on rejection the witness is translated into natural language and the LLM is re-prompted to propose another extension. There is no symbolic repair search.
+
+The runtime-only guardrail baseline allows free planning but blocks violating actions only at execution time; the LLM then retries after receiving a natural-language error.
+
+The verified planner without repair baseline discards invalid extensions with no retry and no symbolic repair.
+
+The full COMPOSER system uses planning-time verification, witness memory, symbolic repair, and runtime mediation.
+
+The Verifier + NL retry condition is the most important baseline because it directly tests whether symbolic repair adds value over ordinary LLM self-correction.
+
+\subsection{Metrics}
+The primary metric is compliance-gated task success: an episode is successful only if it reaches the task goal and commits no hard policy violation.
+
+We also report hard-policy violation rate, denial burden, repair yield, safe-failure accuracy on infeasible tasks, planning latency, token cost, and search effort measured by expanded planner states and repair calls.
+
+For utility, we report
+\[
+\text{UtilityRet}(W)=\hat U(W)=\frac{\sum_{g_i \in G_x} w_i \mathbf{1}[W \vdash g_i]}{\sum_{g_i \in G_x} w_i}.
+\]
+This metric is based on weighted goal discharge only. Structural similarity to the reference workflow is reported separately as a diagnostic, not baked into the primary utility metric, so the system is not penalized for finding a different but valid contract-equivalent solution.
+
+We additionally report excess execution cost relative to the reference workflow:
+\[
+\text{ExcessCost}(W,W_{ref})=\frac{\text{ExecCost}(W)-\text{ExecCost}(W_{ref})}{\text{ExecCost}(W_{ref})}.
+\]
+Reference workflows have positive execution cost by construction, so the denominator is never zero.
+
+\subsection{Ablations}
+We include four main ablations. The first varies repair depth $K \in \{0,1,2\}$, measuring the value of bounded repair over hard rejection. The second removes witness memory, testing whether cached prohibitions reduce repeated invalid proposals. The third disables \texttt{DECOMPOSE}, isolating the value of template-based graph repair relative to simpler edits. The fourth removes provenance constraints, quantifying how much of the gain comes from information-flow governance rather than capability or temporal constraints alone.
+
+A smaller secondary ablation removes human validation from the contract compiler so that all contracts are LLM-drafted. This is not a main claim, but it tests sensitivity to contract quality.
+
+\subsection{Contract compiler sanity check}
+The contract compiler remains supporting infrastructure rather than the main contribution, so its intrinsic evaluation is intentionally limited. We annotate 50 skill or policy descriptions with gold contract fields and measure field-level precision and recall for capabilities, approval clauses, provenance clauses, and temporal clauses. For a 20-example subset, a second annotator independently labels the fields and we report inter-annotator agreement. This gives a reliability check without turning the paper into a contract-induction benchmark.
+
+\subsection{Planned implementation budgets and reporting}
+Our default planner budgets are $B=4$, $T=50$, and $K=2$. We will report average frontier expansions, repair calls, token cost, and wall-clock time per successful episode. This is important because the outer loop combines LLM proposal with symbolic filtering, and the practical value of the method depends on whether the additional verification and repair overhead remains modest relative to the baseline denial-and-retry behavior.
+
+\section{Results and Analysis (draft shell)}
+This section will report the main empirical comparison across both domains. Table~1 will present compliance-gated task success, hard-policy violation rate, denial burden, repair yield, and safe-failure accuracy. The key comparison is between full COMPOSER and the Verifier + NL retry baseline: if symbolic repair is doing real work, COMPOSER should recover a larger fraction of invalid proposals with lower denial burden and better compliance-gated utility.
+
+Section 5.1 will analyze the main cross-domain comparison. Section 5.2 will present ablations over $K$, witness memory, decomposition, and provenance constraints. Section 5.3 will isolate performance on infeasible tasks and safe-failure behavior. Section 5.4 will compare generated and human-authored instances to assess whether the planner is robust beyond template-rendered inputs. Section 5.5 will report the contract compiler sanity check and correlate compiler errors with downstream planning failures.
+
+We will also include one qualitative case study per domain: one example where natural-language retry fails to recover but symbolic graph repair succeeds, and one example where no compliant workflow exists and COMPOSER correctly escalates or fails safely.
+
+\section{Related Work}
+COMPOSER sits between search-oriented orchestration and enforcement-oriented safety.
+
+On the orchestration side, systems such as ADAS and AFlow treat agent design or workflow construction as a search problem and optimize task effectiveness, cost, or latency \citep{ADAS,AFlow}. TaskWeaver and related framework-style planners structure tool use and role assignment, but they do not provide graph-level compliance guarantees under formal provenance, approval, and temporal constraints \citep{TaskWeaver}.
+
+On the enforcement side, PCAS introduces deterministic policy enforcement over dependency graphs; Maris targets privacy and temporal safety in multi-agent collaboration; Agent-C constrains generation under temporal rules; ShieldAgent emphasizes safety verification for agent behavior \citep{PCAS,Maris,Agent-C,ShieldAgent}. These systems are close in spirit, but they mainly enforce policies at runtime or repair locally at the action level. COMPOSER differs by making verification part of planning and by treating workflow repair itself as a bounded symbolic search problem.
+
+Recent work on policy or specification induction from natural language, such as P2T and Doc2Spec, is relevant to our semi-automatic contract compiler \citep{P2T,Doc2Spec}. We use that line of work as enabling infrastructure rather than as the main contribution.
+
+Finally, constrained decoding and structured generation systems such as LMQL, Guidance, Outlines, and SGLang constrain token-level generation or enforce local output schemas \citep{LMQL,Guidance,Outlines,SGLang}. These are complementary but insufficient here: COMPOSER's constraints are relational and global over a workflow graph. For example, whether an agent assignment is valid may depend on approvals, artifact labels, or temporal relations introduced several steps earlier, which cannot in general be enforced by token-level output constraints alone.
+
+\section{Limitations and Discussion}
+COMPOSER's guarantees are conditional. They depend on contract refinement, sound component checkers, and complete mediation of relevant side effects. In the simulator these conditions are satisfied by construction, but in real deployments hidden side effects or inaccurate contract summaries would weaken the guarantee.
+
+The DSL is intentionally narrow. This is a feature for formal clarity, but it also limits coverage. Policies that require richer numeric optimization, open-world reasoning, or subtle semantic judgments may need approximations or manual abstraction.
+
+The exact repair claim is also intentionally bounded. \texttt{EXACT-K-REPAIR} is optimal only within the witness-guided repair neighborhood $\mathcal{R}_K(W';\xi_0)$. A workflow might be repairable outside that neighborhood or beyond the chosen depth bound $K$, in which case the system will safely return failure rather than overclaiming recoverability.
+
+The evaluation is domain-focused rather than benchmark-wide. That is deliberate: our aim is not to introduce a new universal benchmark, but to test whether repair-aware verified planning is practically useful in settings with crisp governance policies.
+
+Despite these limitations, the central claim is useful: there is value in inserting a formal repair-aware planning layer between free-form workflow search and runtime-only blocking.
+
+\section{Conclusion}
+We presented COMPOSER, a repair-aware orchestration algorithm for contract-grounded multi-agent workflows. COMPOSER represents skills as typed contracts, plans over partial-order workflow graphs, verifies candidate graph extensions before execution, and computes bounded minimum-cost compliant repairs when proposals are unsafe or infeasible. This design targets a missing layer between workflow search and runtime guardrails: instead of either hoping the initial workflow is safe or blocking violations after the fact, COMPOSER uses verification as part of planning. The formal result is execution soundness for a supported DSL fragment together with exact minimum-cost K-repair inside a bounded witness-guided neighborhood. The empirical question, addressed in the planned experiments, is whether this combination yields better compliance-gated utility and safer failure behavior than free-form planning, runtime-only enforcement, or natural-language retry.
+
+\bibliographystyle{plainnat}
+\bibliography{bib/references}
+
+\end{document}
